@@ -1,0 +1,8 @@
+/venv
+
+portfolio_backtest_results.png
+STOCK_TRADING_GUIDE.md
+trained_models/
+portfolio_models/
+
+data/
