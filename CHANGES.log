@@ -1,0 +1,490 @@
+================================================================================
+CHANGES LOG — E:\Shashank\stocks
+Auto-appended by Claude Code at the end of every session.
+Format: [YYYY-MM-DD] FILE: description
+================================================================================
+
+--------------------------------------------------------------------------------
+SESSION 2026-05-24 — SAC trainer bug fixes (ep_len=1, reward scale, P&L math)
+--------------------------------------------------------------------------------
+
+[2026-05-24] sac_trainer.py :: BUG 1 — __init__ now sets _day_idx=-1 and calls
+  self.reset() at the end of __init__ so _day_bars is populated before SB3 ever
+  touches the env. Without this, the first step() saw _day_bars=None and returned
+  truncated=True immediately, giving ep_len=1.
+
+[2026-05-24] sac_trainer.py :: BUG 1 — step() guard replaced: removed the silent
+  reset()-and-return that masked bad state. Now uses assert _day_bars is not None
+  and returns zero-obs with truncated=True on normal end-of-day overflow.
+
+[2026-05-24] sac_trainer.py :: BUG 2 — Capital compounding added in step():
+  self._capital += trade_pnl - trade_cost, floored at 1000, _max_capital tracked,
+  self._gr.capital synced. Capital was previously static so model never saw
+  account growth/decline in its reward signal.
+
+[2026-05-24] sac_trainer.py :: BUG 3 — debug_env() function added before
+  run_sac_training(). Runs 200 random-action steps, prints per-episode
+  len/reward/trades, raises RuntimeError if mean ep_len < 10. Training is blocked
+  until the environment is healthy.
+
+[2026-05-24] sac_trainer.py :: BUG 3 — run_sac_training() now builds raw env,
+  calls debug_env(), then wraps in Monitor instead of building wrapped env directly.
+
+[2026-05-24] sac_trainer.py :: BUG 4 — _apply_position() captures check_entry()
+  reason (was discarding with _) and prints "Entry blocked: {reason}" for diagnosis.
+
+[2026-05-24] guardrails.py :: ROOT CAUSE FIX — reset_day() now resets
+  self.realized_pnl = 0.0. Previously realized_pnl accumulated across days;
+  on episode 2 step 1, update_unrealised() saw the full prior-day loss, fired
+  daily_halted=True, and every episode after ep 1 terminated on step 1.
+
+[2026-05-24] guardrails.py :: reset_day() also resets pos_n50=0.0 and
+  pos_nbank=0.0 explicitly as a safety belt (HG8 force-exit should clear these,
+  but belt-and-suspenders against stale state).
+
+[2026-05-24] sac_trainer.py :: DEAD_BAND raised 0.05 → 0.15 → 0.20.
+  SAC's uniform-random init spread across [-1,1]; larger dead-band zeroes out
+  noise trades during early training before the policy has learned anything.
+
+[2026-05-24] sac_trainer.py :: _bars_since_entry_n50 / _bars_since_entry_nbank
+  counters added to __init__ and reset() (both reset to 0), incremented in step()
+  after bar_idx advance. Counter resets to 0 when position is flat.
+
+[2026-05-24] sac_trainer.py :: _apply_position() — minimum hold period:
+  initially MIN_HOLD_BARS=3 (flip-only), then strengthened to MIN_HOLD_BARS=6
+  blocking ANY change while in a position (not just direction flips). This stopped
+  the 33-45 trades/70-bar pattern from random action flipping.
+
+[2026-05-24] sac_trainer.py :: _apply_position() — lots fixed at 1.
+  Old formula max(1, round(pos_frac * capital / (close * lot_size))) gave 1 lot
+  but that's ₹16.5L notional on ₹50k capital = 33× leverage. Fixed to lots=1
+  at all 4 calculation sites (_apply_position, _check_stop_losses × 2,
+  _force_exit × 2, _unrealised_pnl × 2).
+
+[2026-05-24] sac_trainer.py :: P&L formula fixed at all exit sites.
+  Old: pos_fraction * price_move * lot_size * lots / abs(pos_fraction)
+  — this mixed allocation fraction with lot count, effectively multiplying
+  lot_size twice. New formula: direction * price_move * lot_size * lots
+  where direction = 1 if long else -1. Fixed in _apply_position,
+  _check_stop_losses (N50 + NBANK), _force_exit (N50 + NBANK), _unrealised_pnl.
+
+[2026-05-24] sac_trainer.py :: HG3 single-trade loss cap added at every exit:
+  pnl = max(pnl, -(self._capital * 0.02)). Applied in _apply_position,
+  _check_stop_losses (both instruments). Not applied to _force_exit (EOD P&L
+  is what it is; capping would distort account tracking).
+
+[2026-05-24] sac_trainer.py :: _compute_reward() — two asserts added:
+  capital in (0, 10M) and abs(trade_pnl) < capital*2. These crash loud if
+  the capital or P&L state becomes nonsensical rather than silently training
+  on garbage reward values.
+
+[2026-05-24] sac_trainer.py :: _compute_reward() — pnl_pct clipped to ±10%
+  per bar. Before this fix, raw rupee P&L was producing rewards of -14000,
+  which caused SAC's critic to diverge.
+
+[2026-05-24] sac_trainer.py :: _compute_reward() — catastrophic-loss penalty
+  reduced 100 → 10 (it sits inside the ±20 clip anyway; -100 was saturating
+  the critic). Final reward clip tightened from [-200, 200] to [-20, 20].
+
+[2026-05-24] sac_trainer.py :: Overtrading penalty tightened:
+  threshold 10 → 4 trades/day, multiplier 2 → 5 per excess trade.
+  4 trades/day is generous for an intraday system; strong penalty needed to
+  discourage random flipping during early exploration.
+
+--------------------------------------------------------------------------------
+SESSION 2026-05-24 (cont.) — Reward function final calibration before training
+--------------------------------------------------------------------------------
+
+[2026-05-24] sac_trainer.py :: _compute_reward() — core P&L signal rescaled.
+  pnl_pct (range ±10) divided by 10 → pnl_scaled (range ±1) before applying
+  asymmetry multiplier. Old code used raw pnl_pct producing per-bar rewards of
+  ±10 before any penalties, which dominated and destabilised the critic.
+
+[2026-05-24] sac_trainer.py :: _compute_reward() — all penalty/bonus magnitudes
+  recalibrated so every component fits inside [-3, +3] total:
+    catastrophic loss penalty:  10   → 5.0
+    overtrading multiplier:      5   → 1.0  (per trade above threshold 4)
+    time-window violation:      50   → 3.0
+    regime alignment bonus:      1.0 → 0.1
+    exposure concentration:     *10  → *1.0
+    drawdown scaling:           *2   → *0.2
+
+[2026-05-24] sac_trainer.py :: _compute_reward() — survival bonus added:
+  +0.01 per bar when both positions are flat. Gives SAC a weak signal that
+  "do nothing" is a valid baseline, without overwhelming the P&L signal.
+
+[2026-05-24] sac_trainer.py :: _compute_reward() — final clip tightened:
+  [-20, 20] → [-3, 3]. Target: good trading day ≈ +0.5 to +2.0 total episode
+  reward; bad day ≈ -1.0 to -3.0. SAC critic learns best with rewards in ~[-5,+5].
+
+--------------------------------------------------------------------------------
+SESSION 2026-05-24 (cont.) — Pre-training cleanup: silence prints, tighten caps
+--------------------------------------------------------------------------------
+
+[2026-05-24] guardrails.py :: check_entry() — removed OOD_HIGH_VOL print block.
+  The print fired on every blocked bar during 500k training steps (potentially
+  millions of calls). Removed entirely; high-vol state is already tracked via
+  is_high_vol_day and reflected in action scaling via apply_hg10().
+
+[2026-05-24] sac_trainer.py :: _apply_position() — removed "Entry blocked" print.
+  Same reason: fires on every guardrail rejection during training. Now silently
+  returns 0.0, 0.0 without printing.
+
+[2026-05-24] sac_trainer.py :: _apply_position() — MIN_HOLD_BARS raised 6 → 12
+  (30 min → 1 hour minimum hold). Consistent with training plan's target of
+  30-120 min average trade duration. 6 bars was still allowing excess trades
+  with random policy across two instruments.
+
+[2026-05-24] sac_trainer.py :: _apply_position() — hard daily trade cap added
+  as the very first guard: if self._trades_today >= 6: return 0.0, 0.0.
+  Caps at 6 trades/day (3 round-trips per instrument). Checked before hold-period
+  and guardrail checks so it cannot be bypassed by either instrument.
+
+--------------------------------------------------------------------------------
+SESSION 2026-05-24 (cont.) — Reward signal cleanup + episode bleed fix
+--------------------------------------------------------------------------------
+
+[2026-05-24] sac_trainer.py :: _compute_reward() — full rewrite for clean signal.
+  Removed: per-bar overtrading penalty (was -1*(n-4) every bar, drowning P&L),
+  exposure concentration penalty, survival bonus (+0.01*70 bars = +0.7/episode).
+  Kept: core pnl_scaled signal, catastrophic loss (-2.0 at pnl<=-5%), time-window
+  violation (-2.0), regime nudge (+0.05), severe drawdown (-0.5 at >5% daily loss).
+  Net result: reward is now dominated by actual P&L, not structural penalties.
+
+[2026-05-24] sac_trainer.py :: reset() — explicit guardrail state reset added
+  after reset_day() call. Sets gr.pos_n50, gr.pos_nbank, gr.realized_pnl,
+  gr.daily_loss, gr.daily_halted, gr.trades_today all to zero/False explicitly.
+  Belt-and-braces against state bleed causing 0-trade episodes to show pnl=-273.
+
+--------------------------------------------------------------------------------
+SESSION 2026-05-24 (cont.) — Retrain with simplified env after Sharpe -0.20 at 180k
+  Trigger: critic loss oscillating 1.5e5–8.5e5, Sharpe degraded +0.01→-0.20 at 180k.
+  Previous run stopped. These changes apply to run 2.
+--------------------------------------------------------------------------------
+
+[2026-05-24] sac_trainer.py :: Added DummyVecEnv + VecNormalize imports.
+
+[2026-05-24] sac_trainer.py :: SAC_KWARGS — full replacement for stability:
+  gamma 0.99 → 0.95 (critical for short ~70-bar episodes — with gamma=0.99,
+  bar-1 and bar-70 rewards are almost equal weight, confusing the critic),
+  buffer_size 200k → 100k, train_freq 1→4, gradient_steps 1→4 (less frequent
+  but deeper updates), net_arch [256,256]→[128,128] (simpler network for
+  single-instrument mode).
+
+[2026-05-24] sac_trainer.py :: NiftyTradingEnv — added single_instrument=True param.
+  When True: action[1] forced to 0.0, NIFTY BANK _apply_position skipped,
+  NIFTY BANK SL/force-exit skipped. Halves the action space complexity SAC
+  must learn. Plan: get N50 working, then re-enable NBANK.
+
+[2026-05-24] sac_trainer.py :: run_sac_training() — both envs now pass
+  single_instrument=True. Train env wrapped: DummyVecEnv → VecNormalize
+  (norm_obs=False, norm_reward=True, clip_reward=10.0, gamma=0.95).
+  VecNormalize tracks running reward mean/std and normalises — directly
+  fixes critic loss instability. Val env stays raw (not normalised).
+  check_env() now called on train_env_raw (raw gymnasium env) not the VecEnv.
+
+[2026-05-24] sac_trainer.py :: VecNormalize stats saved to vecnormalize.pkl
+  after training — required for correct inference at test time.
+
+[2026-05-24] sac_trainer.py :: EvalCallback + MetricsCallback eval_freq
+  10_000 → 5_000 steps. Catches degradation earlier.
+
+--------------------------------------------------------------------------------
+SESSION 2026-05-24 (cont.) — Hyperparameter tuning for next training run
+  NOTE: Current 500k run was left to finish. These changes apply to run 2+.
+--------------------------------------------------------------------------------
+
+[2026-05-24] sac_trainer.py :: SAC_KWARGS — learning_rate 3e-4 → 1e-4.
+  Critic loss was oscillating between 1.5e5 and 8.5e5. Smaller LR reduces
+  gradient step size, letting the critic converge more smoothly.
+
+[2026-05-24] sac_trainer.py :: SAC_KWARGS — learning_starts 5_000 → 10_000.
+  More random exploration before learning starts gives the replay buffer
+  a richer distribution of (s, a, r, s') transitions before gradient updates begin.
+
+[2026-05-24] sac_trainer.py :: SAC_KWARGS — batch_size 256 → 512.
+  Larger minibatches produce lower-variance gradient estimates, reducing
+  the critic update noise that was driving the loss spikes.
+
+[2026-05-24] sac_trainer.py :: SAC_KWARGS — policy_kwargs now includes
+  optimizer_kwargs=dict(eps=1e-5). Adam's epsilon controls the denominator
+  floor; 1e-5 (vs default 1e-8) dampens large gradient updates on noisy
+  reward signals, acting as implicit gradient clipping.
+
+[2026-05-24] sac_trainer.py :: TOTAL_TIMESTEPS 500_000 → 1_000_000.
+  Complex environment (50 features, 2 outputs, guardrail masking) needs
+  1-2M steps for the critic to stabilise and the actor to find profitable
+  patterns. 500k was insufficient.
+
+--------------------------------------------------------------------------------
+SESSION 2026-05-24 (cont.) — Fix VecNormalize assertion error in EvalCallback
+--------------------------------------------------------------------------------
+
+[2026-05-24] sac_trainer.py :: val_env now wrapped identically to train_env:
+  DummyVecEnv([lambda: val_env_raw]) → VecNormalize(norm_reward=False,
+  training=False). EvalCallback asserts both envs share the same wrapper
+  structure; bare NiftyTradingEnv caused an assertion error at startup.
+
+[2026-05-24] sac_trainer.py :: MetricsCallback._run_eval() — unwrap chain added:
+  env.envs[0] (DummyVecEnv → Monitor/raw), then env.env (Monitor → NiftyTradingEnv).
+  _run_eval() calls gymnasium reset()/step() directly so needs the raw env,
+  not the VecEnv interface.
+
+[2026-05-24] sac_trainer.py :: EvalCallback eval_freq 5_000 → 10_000.
+  EvalCallback runs 20 full episodes each call — too expensive at 5k steps.
+  MetricsCallback (lightweight custom eval) stays at 5_000.
+
+--------------------------------------------------------------------------------
+SESSION 2026-05-24 (cont.) — Volatility regime mismatch fix (train 2x val std)
+  Root cause: model calibrated for 2019-2022 high-vol (std=0.0131) failed on
+  calmer 2023 val (std=0.0061). Four targeted fixes before retraining.
+--------------------------------------------------------------------------------
+
+[2026-05-24] sac_trainer.py :: TRAIN_END 2022-12-31 → 2023-06-30, VAL_START
+  2023-01-01 → 2023-07-01. Adds first-half 2023 calm market to training so
+  model sees both vol regimes. Second half 2023 stays out-of-sample.
+
+[2026-05-24] sac_trainer.py :: TOTAL_TIMESTEPS 1_000_000 → 500_000.
+  1M steps caused overfitting to 2019-2022 vol regime. Single instrument +
+  [128,128] network converges adequately at 500k.
+
+[2026-05-24] sac_trainer.py :: _apply_position() — dynamic SL multiplier.
+  Old: fixed 1.5 (normal) / 2.5 (high-vol) ATR.
+  New: mult = 1.0 + (1.5 * atr_percentile_20d), range 1.0–2.5.
+  Calm day (pct=0.3) → mult=1.45; volatile day (pct=0.8) → mult=2.2.
+  NBANK uses midpoint 0.5 → mult=1.75 (no per-bar pct available).
+
+[2026-05-24] sac_trainer.py :: _check_stop_losses() — TSL thresholds now dynamic.
+  Old: trail at 2×ATR, breakeven at 1×ATR (fixed).
+  New: tsl_mult = 1.0 + (1.5 * atr_pct); trail at tsl_mult×ATR, breakeven at
+  (tsl_mult/2)×ATR. Applied to both N50 and NBANK TSL blocks.
+
+[2026-05-24] sac_trainer.py :: _get_obs() — replaced 0.0 placeholder (port[7])
+  with vol_ratio_norm = clip((atr14/atr_mean_20d − 1) / 2, −0.4, 1.0).
+  Gives SAC an explicit signal for how current volatility compares to training
+  average — allows the model to self-adjust position sizing at inference time.
+
+--------------------------------------------------------------------------------
+SESSION 2026-05-24 (cont.) — Entropy collapse fix (ent_coef→0.003, mean action=0.87)
+  Symptom: ent_coef dropped to 0.003 by 68k steps, ent_coef_loss=-11,
+  model outputting max actions (mean=0.87) on every bar.
+--------------------------------------------------------------------------------
+
+[2026-05-24] sac_trainer.py :: SAC_KWARGS — added target_entropy=-0.5.
+  Auto-tuning was collapsing entropy too aggressively for this environment.
+  Fixed target prevents ent_coef from approaching 0, maintaining exploration
+  throughout training. Theoretical max entropy for 2-action space = log(2)=0.693.
+
+[2026-05-24] sac_trainer.py :: DEAD_BAND raised 0.20 → 0.30.
+  Model learned to always output >0.20 to guarantee execution attempts.
+  0.30 threshold forces more deliberate action selection.
+
+[2026-05-24] sac_trainer.py :: _compute_reward() — action smoothness penalty added.
+  When already in a position, actions with magnitude > 0.5 incur penalty of
+  (action_size - 0.5) * 0.3. Max penalty at action=1.0: -0.15. Discourages
+  "always maximum action" policy without blocking large new entries when flat.
+
+[2026-05-24] sac_trainer.py :: run_sac_training() — checkpoint dir wiped at start.
+  shutil.rmtree on models/sac_multi/checkpoints/ before recreating. Prevents
+  EvalCallback from loading a stale best_model from a failed prior run.
+
+--------------------------------------------------------------------------------
+SESSION 2026-05-27 — Remove VecNormalize; fix reward scaling, entropy, learning_starts
+  Root cause: VecNormalize was distorting the learning signal — ep_rew_mean
+  improved inside the normalised space but real Sharpe reached -2.37. All five
+  changes applied together before restarting Phase 3 training.
+--------------------------------------------------------------------------------
+
+[2026-05-27] sac_trainer.py :: CHANGE 1 — VecNormalize + DummyVecEnv removed entirely.
+  train_env is now Monitor(train_env_raw); val_env is a raw NiftyTradingEnv.
+  Removed: DummyVecEnv/VecNormalize imports, both VecNormalize wrap blocks,
+  vecnormalize.pkl save line, stale unwrap logic in MetricsCallback._run_eval().
+  VecNormalize's running-reward normalisation was creating a gap between what SAC
+  optimised (normalised) and what Sharpe measures (raw ₹ returns).
+
+[2026-05-27] sac_trainer.py :: CHANGE 2 — _compute_reward() rewritten with ATR normalisation.
+  Old: pnl_pct / 10 → [-1,+1] then asymmetric multipliers + structural penalties.
+  New: pnl_pts = net_pnl / 75 (lot-point units), then r = pnl_pts / (daily_atr * 0.1)
+  clipped to [-3,+3]. Capturing 10% of daily ATR = reward +1.0.
+  Regime-direction penalties ±0.2 kept; catastrophic/overtrading penalties removed.
+  Reward is now regime-independent and in a natural [-3,+3] range without external normalisation.
+
+[2026-05-27] sac_trainer.py :: CHANGE 3 — Entropy target + initial ent_coef fixed.
+  target_entropy -0.5 → -1.0 (more negative forces more exploration).
+  Added ent_coef='auto_0.5' so SAC starts entropy coefficient at 0.5 and auto-tunes
+  down, rather than starting near 0 and collapsing immediately.
+
+[2026-05-27] sac_trainer.py :: CHANGE 4 — learning_starts 10_000 → 20_000.
+  Model was updating before the replay buffer had enough diverse (s,a,r,s') transitions;
+  early bad gradient estimates caused critic divergence before useful patterns could form.
+
+--------------------------------------------------------------------------------
+SESSION 2026-05-27 (cont.) — Fix VWAP all-NaN caused by non-DatetimeIndex
+  Root cause: df.groupby(df.index.date) silently produces empty groups when
+  the index dtype is object/string, so the per-day loop never writes any values.
+--------------------------------------------------------------------------------
+
+[2026-05-27] feature_engineering.py :: FIX 1 — _load_csv() now explicitly casts
+  index to DatetimeIndex after read_csv (parse_dates can leave object dtype on
+  some pandas builds) and strips timezone info if present.
+
+[2026-05-27] feature_engineering.py :: FIX 2 — run_feature_engineering() asserts
+  n50.index is a DatetimeIndex with no timezone immediately after loading, before
+  any indicator computation. Prints dtype and date range for confirmation.
+
+[2026-05-27] feature_engineering.py :: FIX 3 — run_feature_engineering() spot-checks
+  VWAP on the first trading day immediately after compute_indicators(). Asserts it
+  is not all-NaN so a bad index type fails loud at Phase 0, not silently in Phase 3.
+
+[2026-05-27] feature_engineering.py :: FIX 4 — compute_vwap() rewritten with
+  explicit DatetimeIndex guard (raises ValueError if wrong type), zero-volume
+  fallback to close price, and a post-compute NaN warning + ffill/bfill patch.
+  Old version used tp * df['volume'] directly before the per-day loop, which
+  silently produced all-NaN when index.date groupby failed.
+
+--------------------------------------------------------------------------------
+SESSION 2026-05-27 (cont.) — price_vs_vwap all-zeros in parquet; add assertions
+  Root cause: VWAP computation falls back to close when volume column is all-zero,
+  making (close - vwap) / vwap = 0 on every bar. The order of operations inside
+  compute_indicators() is correct (vwap before price_vs_vwap); the missing guard
+  was a post-computation assertion that catches this silently.
+--------------------------------------------------------------------------------
+
+[2026-05-27] feature_engineering.py :: Added clarifying comment on the VWAP block
+  in compute_indicators(): "# VWAP — must be assigned before price_vs_vwap is
+  derived from it". No logic change; documents the required ordering.
+
+[2026-05-27] feature_engineering.py :: Added two assertions at the end of
+  compute_indicators(), before return:
+  (1) assert df['vwap'].notna().all() — catches any remaining NaN after compute_vwap
+  (2) assert (df['price_vs_vwap'] != 0).any() — catches the all-zero case where
+      VWAP equals close on every bar (volume all-zero fallback), which was
+      previously silently written to parquet and produced a useless zero feature.
+
+--------------------------------------------------------------------------------
+SESSION 2026-05-27 (cont.) — Replace VWAP with TWAP; replace volume_ratio with range ratio
+  Root cause: NIFTY 50 and NIFTY BANK are index price series — volume is always 0
+  across all 204,167 bars. True VWAP requires volume and is undefined for indices.
+--------------------------------------------------------------------------------
+
+[2026-05-27] feature_engineering.py :: CHANGE 1 — compute_vwap() deleted; replaced
+  with compute_twap(). TWAP = cumulative mean of typical price (H+L+C)/3 since
+  each day's market open. Uses expanding().mean() per day, no volume dependency.
+  Column name kept as 'vwap' for backward compatibility with orb_engine, sac_trainer,
+  and guardrails — no changes needed in those files.
+
+[2026-05-27] feature_engineering.py :: CHANGE 2 — compute_indicators() updated:
+  (a) calls compute_twap() instead of compute_vwap().
+  (b) price_vs_vwap formula uses df['vwap'].replace(0, np.nan) in the denominator
+      to avoid division by zero on the first bar of each day when TWAP = typical price = close.
+  (c) volume_ratio replaced with bar range ratio: bar_range / rolling_20bar_mean_range.
+      Wider bars relative to recent average = more activity. Column name unchanged;
+      zero-volume division was producing NaN for every bar previously.
+
+[2026-05-27] feature_engineering.py :: CHANGE 3 — assertion updated. Old hard
+  assert (price_vs_vwap != 0).any() removed — the first bar of each day correctly
+  has price_vs_vwap = 0. Replaced with diagnostic prints (TWAP valid bars,
+  price_vs_vwap non-zero count) and a softer threshold assert (valid > 90% of bars).
+
+--------------------------------------------------------------------------------
+SESSION 2026-05-27 (cont.) — Disable entropy auto-tuning; fix reward scale
+  Symptom: ent_coef collapses from 0.5 → 0.06 by 40k steps on every training run
+  regardless of target_entropy setting. ep_rew_mean of -8.87 indicates the
+  ATR-normalised reward at 0.1× divisor is too sensitive for 200k capital / 1 lot.
+--------------------------------------------------------------------------------
+
+[2026-05-27] sac_trainer.py :: SAC_KWARGS — ent_coef 'auto_0.5' → 0.2 (fixed).
+  Removed target_entropy=-1.0. Auto-tuning mechanism collapses entropy to near-zero
+  every run; fixed value of 0.2 maintains stable exploration throughout training.
+
+[2026-05-27] sac_trainer.py :: _compute_reward() — ATR normaliser divisor 0.1 → 0.5.
+  Old: r = pnl_pts / (daily_atr * 0.1) — with 200k capital, 1 lot, ATR≈100 pts,
+  a 10-pt move gives pnl_pts=0.13, reward=0.013 (far too small relative to penalties).
+  New divisor 0.5× ATR makes the core reward 5× more responsive to real P&L moves,
+  keeping the [-3,+3] clip meaningful.
+
+--------------------------------------------------------------------------------
+SESSION 2026-05-27 (cont.) — Add live_trader.py (Signal 2 paper/live trading)
+--------------------------------------------------------------------------------
+
+[2026-05-27] live_trader.py :: Created. Implements real-time Signal 2 intraday
+  strategy for NIFTY 50. Key components:
+  - UpstoxFeed: polls intraday 5-min candles via REST (GET /v2/historical-candle/
+    intraday/{key}/5minute); place_order() for live mode.
+  - IndicatorState: incremental ATR(14) via Wilder's smoothing; TWAP (daily
+    cumulative mean of TP=(H+L+C)/3) replacing VWAP for index data.
+  - ORBTracker: locks ORB high/low/valid from first 8 bars (9:15-9:54).
+  - RegimeInferencer: rolls 50-bar feature window through saved LSTM model.
+  - check_signal2(): long if regime=2 + close > ORB_HIGH + close > TWAP;
+    short if regime=0 + close < ORB_LOW + close < TWAP. Window 12:00-14:30.
+  - Position: SL = entry - dir*2.0*ATR, TP = entry + dir*4.0*ATR, EOD at 15:00.
+  - PaperLogger: appends CSV to logs/paper_trades_YYYY-MM-DD.csv with columns:
+    date, time, direction, entry_price, sl, tp, atr, regime, exit_reason,
+    exit_price, pnl, cumulative_pnl.
+  - PAPER_MODE=True flag. False routes orders through Upstox place_order API.
+  - One Signal 2 trade per day (signal_fired flag).
+  - Guardrails.check_entry() called before every entry (HG1/HG2 enforced).
+  - Guardrails.daily_halted triggers force-exit mid-session.
+
+--------------------------------------------------------------------------------
+SESSION 2026-05-28 — live_trader.py: token from .env, retry, clean logging
+--------------------------------------------------------------------------------
+
+[2026-05-28] live_trader.py :: Token source changed from data_puller.get_access_token()
+  (OAuth flow) to os.getenv('UPSTOX_ACCESS_TOKEN') read from .env. User sets token
+  each morning; _get_token() raises SystemExit with clear instructions if missing.
+  401 response from Upstox also raises SystemExit with update instructions.
+
+[2026-05-28] live_trader.py :: fetch_today_bars() and place_order() now retry up to
+  3 times with 30-second waits between attempts (API_RETRY_WAIT=30, API_MAX_RETRIES=3)
+  instead of returning [] on first failure. Network blips no longer crash the session.
+
+[2026-05-28] live_trader.py :: Log format changed to %(message)s — time prefix embedded
+  in each message as "HH:MM - description". Added _t(ts), _now_t(), _pnl_str() helpers.
+  Messages now match the expected format exactly:
+    "09:15 - Session started [mode=PAPER capital=Rs50000]"
+    "09:54 - ORB computed: HIGH=24350  LOW=24180  Range=0.70%  [VALID]"
+    "12:15 - Signal 2 check: close=24380, above ORB_HIGH (24350), regime=Bull"
+    "12:15 - SIGNAL FIRED: LONG at 24380, SL=24260, TP=24620"
+    "14:35 - TP hit at 24620, P&L=+Rs4050"
+    "15:00 - Session ended, no open positions  |  Day P&L: +Rs4050"
+
+[2026-05-28] live_trader.py :: ORBTracker.update() now returns bool (True on first lock)
+  so LiveTrader._process_bar() can log the ORB message at the correct bar time.
+  Added ORBTracker.locked and range_pct as public attributes. Removed internal log.
+
+[2026-05-28] live_trader.py :: Signal 2 window (12:00-14:30) now logs a per-bar
+  status line showing close vs ORB levels and current regime, even when no signal fires.
+  Makes it easy to see why signal hasn't fired yet during the afternoon window.
+
+--------------------------------------------------------------------------------
+SESSION 2026-05-28 (cont.) — Persist eval metrics to log file
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+SESSION 2026-05-28 (cont.) — get_token.py: daily OAuth token automation
+--------------------------------------------------------------------------------
+
+[2026-05-28] get_token.py :: Created. Automates the daily Upstox token refresh:
+  reads api_key/api_secret/redirect_url from .env, opens browser to OAuth login,
+  prompts user to paste the redirect URL (contains ?code=), extracts the code,
+  POSTs to Upstox token exchange endpoint, writes UPSTOX_ACCESS_TOKEN back to
+  .env via dotenv.set_key(). Prints "Token saved. Valid until midnight."
+
+[2026-05-28] live_trader.py :: Docstring updated to say "run get_token.py each
+  morning" instead of manually editing .env. Added module-level
+  ACCESS_TOKEN = os.getenv('UPSTOX_ACCESS_TOKEN') after load_dotenv().
+  _get_token() now references ACCESS_TOKEN and error message points to
+  get_token.py instead of the Upstox developer console.
+
+--------------------------------------------------------------------------------
+SESSION 2026-05-28 (cont.) — Persist eval metrics to log file
+--------------------------------------------------------------------------------
+
+[2026-05-28] sac_trainer.py :: MetricsCallback now accepts log_path parameter.
+  At init, appends a timestamped run header to the file (append mode so multiple
+  runs accumulate). In _run_eval(), writes the same line printed to console:
+  "[Eval @N]  Sharpe=X  Sortino=X  MaxDD=X%  WinRate=X%"
+  run_sac_training() passes log_path=MODELS_DIR/"eval_metrics.log".
+
+================================================================================

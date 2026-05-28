@@ -1,8 +1,13 @@
 /venv
-
+.env
 portfolio_backtest_results.png
 STOCK_TRADING_GUIDE.md
 trained_models/
 portfolio_models/
 
 data/
+features/
+__pycache__/
+.claude/
+models/
+execution_plan.md

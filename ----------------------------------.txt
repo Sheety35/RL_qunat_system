@@ -1,0 +1,53 @@
+----------------------------------
+| rollout/           |           |
+|    ep_len_mean     | 1         |
+|    ep_rew_mean     | 0         |
+| time/              |           |
+|    episodes        | 499984    |
+|    fps             | 23        |
+|    time_elapsed    | 21594     |
+|    total_timesteps | 499998    |
+| train/             |           |
+|    actor_loss      | -4.44e-09 |
+|    critic_loss     | 5.5e-15   |
+|    ent_coef        | 3.25e-16  |
+|    ent_coef_loss   | 88.4      |
+|    learning_rate   | 0.0003    |
+|    n_updates       | 494997    |
+----------------------------------
+Eval num_timesteps=500000, episode_reward=0.00 +/- 0.00
+Episode length: 1.00 +/- 0.00
+----------------------------------
+| eval/              |           |
+|    mean_ep_length  | 1         |
+|    mean_reward     | 0         |
+| time/              |           |
+|    total_timesteps | 500000    |
+| train/             |           |
+|    actor_loss      | -3.11e-09 |
+|    critic_loss     | 7.96e-15  |
+|    ent_coef        | 3.25e-16  |
+|    ent_coef_loss   | 71.7      |
+|    learning_rate   | 0.0003    |
+|    n_updates       | 494999    |
+----------------------------------
+
+SAC training complete.
+  Final model  → models\sac_multi\final_model.zip
+  Best model   → models\sac_multi/best_model.zip
+  Metadata     → models\sac_multi/metadata.json
+
+*** Run test-set evaluation next (touch 2024 data only once). ***
+Phase 3 done in 360m 38s
+
+============================================================
+  All done
+============================================================
+Total time: 363m 59s
+
+Next steps:
+  1. Inspect validation metrics printed during SAC training
+  2. Once Sharpe > 1.5 and MaxDD < 15% on val set:
+     python backtest.py   # final evaluation on 2024 test set
+  3. Paper trade ≥ 1 month before any live capital
+(venv) PS E:\Shashank\stocks>  

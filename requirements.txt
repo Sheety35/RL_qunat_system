@@ -1,0 +1,24 @@
+# NSE Intraday Trading System — Python dependencies
+# Install with: pip install -r requirements.txt
+#
+# PyTorch (CPU): if you want GPU support, install the CUDA build manually from
+#   https://pytorch.org/get-started/locally/
+# then comment out the torch line below (it's already installed in your venv).
+
+# ── Core data ─────────────────────────────────────────────────────────────────
+numpy>=1.26
+pandas>=2.0
+pyarrow>=14.0          # parquet read/write
+
+# ── ML ────────────────────────────────────────────────────────────────────────
+torch>=2.0             # LSTM regime classifier (CPU build is fine)
+scikit-learn>=1.3      # StandardScaler, metrics
+
+# ── Reinforcement learning ────────────────────────────────────────────────────
+gymnasium>=0.29        # custom trading environment
+stable-baselines3>=2.0 # SAC implementation
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+requests>=2.31         # data_puller.py (Upstox API)
+python-dotenv>=1.0     # .env file for API credentials
+joblib>=1.3            # scaler serialisation (comes with scikit-learn)

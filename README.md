@@ -1,72 +1,128 @@
-# Stocks RL — Existing Work
+# NSE Intraday Trading System
 
-Reinforcement-learning experiments for stock and portfolio trading using TensorFlow/Keras, gymnasium, and yfinance data. Two trainers (single-stock and multi-stock) plus testing/diagnostics scripts.
+Intraday algorithmic trading system for NSE indices (NIFTY 50 and NIFTY BANK) using a 3-layer ML architecture with hard guardrails and an ORB signal engine.
+
+Full details: [TRAINING_PLAN.md](TRAINING_PLAN.md)
+
+---
+
+## Architecture
+
+```
+NIFTY 50 + NIFTY BANK + 15 sector index CSVs (5-min OHLCV)
+                        |
+          +-------------+-------------+
+          |                           |
+  Layer 1: LSTM Classifier     ORB Engine (rules)
+  (supervised, softmax)        Signal 1 (11AM) → standalone rule
+  Bull / Bear / Flat           Signal 2 (afternoon) → SAC feature
+          |                           |
+  Layer 2: Trend Detector            |
+  Rule-based: UP/DOWN/FLAT           |
+          |                           |
+          +-------------+-------------+
+                        |
+                Layer 3: SAC
+                Continuous sizing: -1.0 to +1.0
+                (short 100% <-> long 100%)
+                        |
+              Hard Guardrail Layer
+              Pure Python rules — overrides model output
+                        |
+                Upstox Execution API
+```
+
+---
+
+## Model summary
+
+| Layer | Type | What it does |
+|---|---|---|
+| Layer 1 | LSTM Classifier (supervised) | Classifies current market regime (Bull/Bear/Flat) from last 50 candles; softmax head; also outputs confidence probability used by HG11 |
+| Layer 2 | Rule-based | Detects trend direction and strength (ADX, EMA, SMA) |
+| ORB Engine | Rule-based | Signal 1 (~17/yr) executes as a standalone rule, NOT routed through SAC. Signal 2 (~200/yr) passes `orb_signal2_active` and `orb_signal2_direction` to SAC as features |
+| Layer 3 | SAC — single multi-output agent | Two action heads: `action[0]` = NIFTY 50 size, `action[1]` = NIFTY BANK size (each −1.0 to +1.0). Shared capital pool — if total exposure > 80%, both outputs scaled proportionally |
+| Guardrails | Pure Python | Hard rules that override any model output (see below) |
+
+---
+
+## Hard guardrails (model cannot override these)
+
+| # | Rule | Trigger | Action |
+|---|---|---|---|
+| HG1 | Time fence | Before 09:55 or after 15:00 | Block all new entries |
+| HG2 | Daily loss halt | Drawdown > 3% in a day | Exit all, halt trading for the day |
+| HG3 | Max trade risk | SL distance > 2% of capital | Reduce lot size |
+| HG4 | Position cap | Any single instrument > 30% of capital | Block buy |
+| HG5 | Total exposure cap | Sum of positions > 80% of capital | Scale both SAC outputs proportionally |
+| HG6 | ORB range filter | ORB range > 2% or < 0.1% | Skip ORB signals for the day |
+| HG7 | Conflict filter | Signal 1 fired opposite to Signal 2 direction | Skip Signal 2 |
+| HG8 | 15:00 hard exit | Clock hits 15:00 | Market-sell everything, no exceptions |
+| HG9 | Stop loss required | Any new entry | Reject order if no SL attached |
+| HG10 | Extreme volatility scaling | ATR > 3× rolling 20d mean ATR | Halve all new position sizes; disable Signal 2 for the day |
+| HG11 | Regime uncertainty gate | `max(regime_softmax_probs) < 0.5` | Cap SAC action magnitude at ±0.3 |
+
+---
+
+## Data
+
+All training uses only the 17 CSVs already in `data/`. No additional data will be pulled.
+
+| File | Rows | Range | Role |
+|---|---|---|---|
+| NIFTY 50_5minute.csv | 204,167 | 2015–2026 | Primary trading instrument + regime training |
+| NIFTY BANK_5minute.csv | 204,157 | 2015–2026 | Secondary trading instrument |
+| NIFTY AUTO, ENERGY, FIN SERVICE, FMCG, INFRA, IT, COMMODITIES, CONSUMPTION (+ BANK already above) | 147k–204k each | 2015–2026 | **Sector breadth** (9 long-history indices only — all start 2015) |
+| NIFTY ALPHA 50, CPSE, GS COMPSITE, CONSR DURBL, HEALTHCARE, IND DIGITAL, INDIA MFG | 63k–121k | varies | NOT used for breadth (shorter history causes NaNs before 2022) |
+
+Training split (walk-forward, never mixed):
+- **Train:** 2019–2022 (bull run, COVID crash, 2022 rate-shock bear)
+- **Validate:** 2023 (out-of-sample)
+- **Test:** 2024 (touch once at the very end only)
+
+---
+
+## Capital and risk rules
+
+- Starting capital: ₹50,000 (paper money)
+- Max position per instrument: 30% of capital
+- Max risk per trade: 2% of capital
+- Max daily loss: 3% of capital → halt for the day
+- No overnight positions — all squared off by 15:00
+
+**Transaction costs and slippage (applied on every order, training and backtest):**
+- Brokerage: ₹20 flat per order (Upstox)
+- STT: 0.01% of turnover, sell side only
+- Exchange charges: 0.005% of turnover
+- Slippage: 1 pt average for NIFTY 50, 2 pts for NIFTY BANK
+- Formula: `cost = 20 + (value × 0.0001 if SELL) + (value × 0.00005) + (slip_pts × lot_size × lots)`
+- Lot sizes: NIFTY 50 = 75, NIFTY BANK = 35
+
+---
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `rl_model.py` | **Single-stock DQN trainer.** Trains a Deep Q-Network on AAPL daily data (2019-01-01 to 2024-01-01). 3 actions (Hold/Buy/Sell), 12-dim observation (balance, holdings, price, volume, SMA-5/20, RSI, risk metrics). $1,000 starting capital, 40% max-loss stop, 30% profit target. Saves to `trained_models/`. |
-| `multi_rl.py` | **Multi-stock portfolio DQN trainer.** 6 stocks (AAPL, GOOGL, MSFT, TSLA, AMZN, NVDA). 5 actions per stock (Hold / Buy / Sell / Buy More / Sell Half) = 30 total actions. Adds diversification bonus, position-concentration penalty (max 25 % per stock), Huber loss. $10,000 starting capital. Saves to `portfolio_models/`. |
-| `test_portfolio_model.py` | Loads the most recent portfolio `.h5` model and backtests it on the last N days of fresh yfinance data. Produces `portfolio_backtest_results.png`. |
-| `debug_portfolio_model.py` | Inspects model behaviour on fresh data — counts action choices, dumps Q-values, exposes why the policy under-trades. |
-| `test.py` | Companion diagnostics: deep Q-value analysis, observation-space sanity check, action-execution test, fix recommendations. |
-| `trained_models/` | Saved single-stock model (`best_model_20250813_000605.h5`) plus metadata. |
-| `portfolio_models/` | Saved portfolio model (`best_portfolio_model_20250813_011128.h5`) plus metadata. |
-| `portfolio_backtest_results.png` | Last backtest output chart. |
-| `venv/` | Local Python virtual environment (TensorFlow, gymnasium, yfinance, pandas, matplotlib). |
+| `data_puller.py` | Upstox OAuth + historical data fetch (data collection complete, not needed again) |
+| `orb_engine.py` | ORB signal computation — to be built |
+| `guardrails.py` | Hard guardrail rules — to be built |
+| `feature_engineering.py` | Compute all indicators + sector breadth, save `features/` — to be built |
+| `regime_trainer.py` | Train supervised LSTM Classifier on NIFTY 50 — to be built |
+| `sac_trainer.py` | Train single multi-output SAC (NIFTY 50 + NIFTY BANK) — to be built |
+| `backtest.py` | Walk-forward evaluation, Sharpe + Sortino output — to be built |
+| `live_trader.py` | Paper → live trading via Upstox API — to be built |
+| `TRAINING_PLAN.md` | Full architecture, guardrails, all model questions, training pipeline |
+| `STOCK_TRADING_GUIDE.md` | Feasibility assessment and 6-month roadmap |
 
-## Architecture (current)
+---
 
-```
-yfinance daily OHLCV
-        |
-        v
-StockTradingEnvironment / PortfolioTradingEnvironment   (gymnasium env)
-        |
-        v
-DQNAgent / PortfolioDQNAgent                            (Keras MLP, target net, epsilon-greedy)
-        |
-        v
-.h5 model + .pkl metadata
-        |
-        v
-Backtest on hold-out / live yfinance window
-```
+## Next steps
 
-## How to run
-
-```powershell
-# 1. activate the existing venv
-.\venv\Scripts\Activate.ps1
-
-# 2. train single-stock model (long — ~1500 episodes)
-python rl_model.py
-
-# 3. train portfolio model (longer — ~2000 episodes, 6 stocks)
-python multi_rl.py
-
-# 4. backtest the saved portfolio model on the most recent ~90 days
-python test_portfolio_model.py
-
-# 5. diagnose model behaviour
-python debug_portfolio_model.py
-python test.py
-```
-
-## Known issues (from the diagnostic scripts themselves)
-
-The comments inside `test.py` already flag these:
-
-1. **Policy over-prefers Hold.** Reward structure rewards capital preservation more than active trading, so the model parks in cash.
-2. **No opportunity-cost penalty.** Sitting idle while the market rallies isn't punished.
-3. **Sparse diversification incentive.** Bonus exists but is small vs the concentration penalty.
-4. **Action space may be unbalanced.** 30 discrete actions with skewed Q-values; some action indices barely fire.
-5. **Observation space is too local.** Only the stock's own SMA/RSI — no market-relative or momentum features, no volatility, no regime indicator.
-6. **Single training window (2019–2024).** Covers a long bull run + COVID crash, but no test of bear-market regimes or rate-shock periods.
-7. **Daily bars only.** Real-time / intraday trading is not actually supported by the current data pipeline.
-
-## Status
-
-**Working:** the training loop runs, models save, backtests execute, diagnostics catch the behavioural problems.
-**Not working as a profitable trader:** see issues above, and `STOCK_TRADING_GUIDE.md` for the full assessment + recommended next steps.
+1. `orb_engine.py`
+2. `guardrails.py`
+3. `feature_engineering.py`
+4. `regime_trainer.py`
+5. `sac_trainer.py`
+6. `backtest.py`
+7. Paper trade 1 month minimum before live capital
