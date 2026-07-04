@@ -11,7 +11,6 @@ Token setup (do this each morning):
 
 Prerequisites:
     - .env with api_key, api_secret, redirect_url set
-    - models/regime_classifier/best_model.pt and scaler.pkl trained
 """
 
 from __future__ import annotations
@@ -19,20 +18,16 @@ from __future__ import annotations
 import csv
 import logging
 import os
-import pickle
 import time
-from collections import deque
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import requests
-import torch
 from dotenv import load_dotenv
 
 from guardrails import Guardrails, LOT_SIZE_N50
-from regime_trainer import RegimeLSTM, SEQ_LEN
 
 load_dotenv()
 ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN")
@@ -59,15 +54,11 @@ EOD_EXIT    = (15,  0)
 SESSION_END = (15,  5)
 
 ATR_PERIOD      = 14
-REGIME_SEQ_LEN  = SEQ_LEN   # 50 bars
 API_RETRY_WAIT  = 30         # seconds between retry attempts
 API_MAX_RETRIES = 3
 
-MODELS_DIR = Path("models") / "regime_classifier"
-LOG_DIR    = Path("logs")
+LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
-
-_REGIME_NAME = {0: "Bear", 1: "Flat", 2: "Bull"}
 
 # ── Logging — plain message format so HH:MM prefix controls the layout ────────
 
@@ -277,78 +268,6 @@ class IndicatorState:
         return self._twap_current
 
 
-# ── Regime inference ──────────────────────────────────────────────────────────
-
-class RegimeInferencer:
-    """Rolls a 50-bar feature window through the saved LSTM model."""
-
-    def __init__(self):
-        self._model:     RegimeLSTM | None = None
-        self._scaler                       = None
-        self._device     = torch.device("cpu")
-        self._feat_cols: list[str]         = []
-        self._window:    deque             = deque(maxlen=REGIME_SEQ_LEN)
-        self._regime:    int               = 1
-        self._prob:      float             = 1 / 3
-        self._load()
-
-    def _load(self) -> None:
-        ckpt_path = MODELS_DIR / "best_model.pt"
-        scl_path  = MODELS_DIR / "scaler.pkl"
-        if not ckpt_path.exists():
-            log.warning("%s - Regime model not found — defaulting to Flat", _now_t())
-            return
-        ckpt = torch.load(ckpt_path, map_location=self._device)
-        self._feat_cols = ckpt["feat_cols"]
-        self._model     = RegimeLSTM(input_size=len(self._feat_cols)).to(self._device)
-        self._model.load_state_dict(ckpt["model_state"])
-        self._model.eval()
-        with open(scl_path, "rb") as f:
-            self._scaler = pickle.load(f)
-
-    def push(self, bar: Bar, inds: IndicatorState) -> None:
-        if self._model is None:
-            return
-        atr   = inds.atr14
-        close = bar.close
-        prev_close = self._window[-1].get("close", close) if self._window else close
-        feats = {
-            "close_return":        close / prev_close - 1,
-            "ema_spread_pct":      0.0,
-            "price_vs_sma1500":    0.0,
-            "rsi14":               50.0,
-            "macd_pct":            0.0,
-            "atr14_pct":           (atr / close) if (close > 0 and not np.isnan(atr)) else 0.0,
-            "bb_width":            0.0,
-            "price_vs_vwap":       ((close - inds.twap) / inds.twap
-                                    if not np.isnan(inds.twap) and inds.twap > 0 else 0.0),
-            "sector_breadth_norm": 0.5,
-            "volume_ratio":        1.0,
-            "close":               close,
-        }
-        self._window.append(feats)
-        if len(self._window) < REGIME_SEQ_LEN:
-            return
-        feat_arr = np.array(
-            [[w.get(c, 0.0) for c in self._feat_cols] for w in self._window],
-            dtype=np.float32,
-        )
-        feat_arr = self._scaler.transform(feat_arr)
-        x = torch.tensor(feat_arr, dtype=torch.float32).unsqueeze(0)
-        with torch.no_grad():
-            probs = torch.softmax(self._model(x), dim=1).cpu().numpy()[0]
-        self._regime = int(probs.argmax())
-        self._prob   = float(probs.max())
-
-    @property
-    def regime(self) -> int:
-        return self._regime
-
-    @property
-    def name(self) -> str:
-        return _REGIME_NAME[self._regime]
-
-
 # ── ORB tracker ───────────────────────────────────────────────────────────────
 
 class ORBTracker:
@@ -387,8 +306,7 @@ class ORBTracker:
 
 # ── Signal 2 ──────────────────────────────────────────────────────────────────
 
-def check_signal2(bar: Bar, orb: ORBTracker,
-                  regime: int, twap: float) -> int:
+def check_signal2(bar: Bar, orb: ORBTracker, twap: float) -> int:
     """Returns +1 (long), -1 (short), or 0 (no signal)."""
     if not orb.orb_valid or orb.orb_high is None:
         return 0
@@ -398,9 +316,9 @@ def check_signal2(bar: Bar, orb: ORBTracker,
         return 0
     c = bar.close
     twap_ok = np.isnan(twap) or twap <= 0   # skip TWAP check if unavailable
-    if regime == 2 and c > orb.orb_high and (twap_ok or c > twap):
+    if c > orb.orb_high and (twap_ok or c > twap):
         return 1
-    if regime == 0 and c < orb.orb_low  and (twap_ok or c < twap):
+    if c < orb.orb_low and (twap_ok or c < twap):
         return -1
     return 0
 
@@ -410,7 +328,7 @@ def check_signal2(bar: Bar, orb: ORBTracker,
 class PaperLogger:
     COLUMNS = [
         "date", "time", "direction", "entry_price", "sl", "tp", "atr",
-        "regime", "exit_reason", "exit_price", "pnl", "cumulative_pnl",
+        "exit_reason", "exit_price", "pnl", "cumulative_pnl",
     ]
 
     def __init__(self):
@@ -445,18 +363,16 @@ class Position:
         self.sl:           float          = 0.0
         self.tp:           float          = 0.0
         self.atr_at_entry: float          = 0.0
-        self.regime:       int            = 1
 
     @property
     def is_open(self) -> bool:
         return self.direction != 0
 
-    def open(self, bar: Bar, direction: int, atr: float, regime: int) -> None:
+    def open(self, bar: Bar, direction: int, atr: float) -> None:
         self.direction    = direction
         self.entry_price  = bar.close
         self.entry_time   = bar.ts
         self.atr_at_entry = atr
-        self.regime       = regime
         self.sl           = bar.close - direction * SL_ATR_MULT * atr
         self.tp           = bar.close + direction * TP_ATR_MULT * atr
 
@@ -494,7 +410,6 @@ class LiveTrader:
         token          = _get_token()
         self._feed     = UpstoxFeed(token)
         self._inds     = IndicatorState()
-        self._regime   = RegimeInferencer()
         self._orb      = ORBTracker()
         self._pos      = Position()
         self._logger   = PaperLogger()
@@ -507,12 +422,10 @@ class LiveTrader:
     def _process_bar(self, bar: Bar) -> None:
         self._inds.update(bar)
         just_locked = self._orb.update(bar)
-        self._regime.push(bar, self._inds)
 
-        atr    = self._inds.atr14
-        twap   = self._inds.twap
-        regime = self._regime.regime
-        ts     = _t(bar.ts)
+        atr  = self._inds.atr14
+        twap = self._inds.twap
+        ts   = _t(bar.ts)
 
         # ── ORB lock announcement ─────────────────────────────────────────
         if just_locked:
@@ -541,15 +454,15 @@ class LiveTrader:
                 vs_orb = f"below ORB_LOW ({self._orb.orb_low:.0f})"
             else:
                 vs_orb = "inside ORB range"
-            log.info("%s - Signal 2 check: close=%.0f, %s, regime=%s",
-                     ts, bar.close, vs_orb, self._regime.name)
+            log.info("%s - Signal 2 check: close=%.0f, %s",
+                     ts, bar.close, vs_orb)
 
         if self._signal_fired:
             return
         if np.isnan(atr) or atr <= 0:
             return
 
-        sig = check_signal2(bar, self._orb, regime, twap)
+        sig = check_signal2(bar, self._orb, twap)
         if sig == 0:
             return
 
@@ -559,15 +472,15 @@ class LiveTrader:
             log.info("%s - Entry blocked: %s", ts, block_reason)
             return
 
-        self._enter(bar, sig, atr, regime)
+        self._enter(bar, sig, atr)
 
-    def _enter(self, bar: Bar, direction: int, atr: float, regime: int) -> None:
+    def _enter(self, bar: Bar, direction: int, atr: float) -> None:
         order_id = self._feed.place_order(direction, bar.close)
         if order_id is None:
             log.error("%s - Order failed — position not opened", _t(bar.ts))
             return
 
-        self._pos.open(bar, direction, atr, regime)
+        self._pos.open(bar, direction, atr)
         self._signal_fired = True
 
         side = "LONG" if direction > 0 else "SHORT"
@@ -600,7 +513,6 @@ class LiveTrader:
             "sl":          round(self._pos.sl,           2),
             "tp":          round(self._pos.tp,           2),
             "atr":         round(self._pos.atr_at_entry, 2),
-            "regime":      self._pos.regime,
             "exit_reason": reason,
             "exit_price":  round(ex_price, 2),
             "pnl":         round(pnl,      2),

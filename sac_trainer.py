@@ -15,12 +15,15 @@ Run standalone or imported by train.py.
 """
 
 from __future__ import annotations
+import datetime
 import json
+import sys
 import warnings
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
 import gymnasium as gym
 from gymnasium import spaces
 from stable_baselines3 import SAC
@@ -39,6 +42,8 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 FEATURES_DIR = Path("features")
 MODELS_DIR   = Path("models") / "sac_multi"
+LOGS_DIR     = Path("logs")
+TRAINING_LOG = LOGS_DIR / "training_log.txt"
 
 CAPITAL      = 50_000.0
 TRAIN_START  = "2019-01-01"
@@ -49,14 +54,15 @@ VAL_END      = "2023-12-31"
 # SB3 SAC hyperparameters
 SAC_KWARGS = dict(
     learning_rate   = 3e-5,
-    buffer_size     = 100_000,
-    learning_starts = 20_000,
+    buffer_size     = 100_000,     # small buffer — random-phase transitions age out instead of poisoning late updates
+    learning_starts = 5_000,       # buffer is pre-seeded with rule-policy demos; 20k random steps no longer needed
     batch_size      = 512,
-    tau             = 0.005,
+    tau             = 0.002,       # slower target updates — dampens Q-overestimation feedback loop
     gamma           = 0.95,        # lower gamma for short episodes (~70 bars/day)
     train_freq      = 1,
     gradient_steps  = 1,
-    ent_coef        = 0.2,          # fixed — auto-tuning collapses to 0.06 by 40k steps every run
+    ent_coef        = "auto",      # fixed 0.2 dominated the small per-bar rewards and pulled the policy back to random
+    target_entropy  = -1.0,        # entropy floor above SB3 default (-2 for 2D actions) so auto-tuning can't collapse to ~0
     policy_kwargs   = dict(
         net_arch=[128, 128],
         optimizer_kwargs=dict(eps=1e-5),
@@ -703,6 +709,171 @@ class MetricsCallback(BaseCallback):
         return float(abs(dds.min()))
 
 
+# ── Critic health monitor ─────────────────────────────────────────────────────
+
+class CriticMonitorCallback(BaseCallback):
+    """
+    Logs mean Q-value and current entropy coefficient every `check_freq` steps
+    (TensorBoard: diagnostics/mean_q, diagnostics/ent_coef).
+
+    Q-values steadily inflating right before a performance collapse means
+    overestimation bias is compounding — the policy chases phantom value.
+    With gamma=0.95 and reward clipped to [-3,3], |Q| has a theoretical
+    ceiling of 3/(1-0.95)=60; anything approaching it is divergence.
+    """
+
+    def __init__(self, check_freq: int = 2_000, verbose: int = 0):
+        super().__init__(verbose)
+        self._freq = check_freq
+        self._warned = False
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps % self._freq != 0:
+            return True
+        rb = self.model.replay_buffer
+        if rb is None or rb.size() < 256:
+            return True
+
+        data = rb.sample(256, env=None)
+        with torch.no_grad():
+            q_vals = torch.cat(
+                self.model.critic(data.observations, data.actions), dim=1)
+            mean_q = float(q_vals.min(dim=1).values.mean())
+
+        log_ec = getattr(self.model, "log_ent_coef", None)
+        if log_ec is not None:
+            ent_coef = float(torch.exp(log_ec.detach()).item())
+        else:
+            ent_coef = float(self.model.ent_coef_tensor)
+
+        self.logger.record("diagnostics/mean_q", mean_q)
+        self.logger.record("diagnostics/ent_coef", ent_coef)
+
+        if abs(mean_q) > 45 and not self._warned:
+            self._warned = True
+            print(f"\n*** WARNING @{self.num_timesteps}: mean Q = {mean_q:.1f} "
+                  f"is approaching the theoretical ceiling (60). "
+                  f"Critic is likely diverging — check diagnostics/mean_q in TensorBoard. ***")
+        return True
+
+
+# ── Behaviour-cloning warm start from the Signal-2 rule ──────────────────────
+
+RULE_TARGET = 0.6   # rule-policy position size (must exceed DEAD_BAND=0.30)
+
+def collect_rule_demonstrations(env: NiftyTradingEnv):
+    """
+    Run the Signal-2 rule policy (same logic as live_trader.py) over every
+    training day and record (obs, action, reward, next_obs, done, truncated)
+    transitions. One trade per day: enter in orb_signal2_dir when
+    orb_signal2_active fires in the 12:00–14:30 window, hold until the env
+    closes it (SL/TSL or 15:00 exit).
+    """
+    obs_l, act_l, rew_l, next_l, done_l, trunc_l = [], [], [], [], [], []
+    n_trades, total_pnl = 0, 0.0
+
+    for _ in range(len(env._all_dates)):
+        obs, _ = env.reset()
+        fired = holding = False
+        target = 0.0
+        done = trunc = False
+        while not (done or trunc):
+            idx = env._day_bars[min(env._bar_idx, len(env._day_bars) - 1)]
+            row = env.n50.loc[idx]
+            hour, minute = idx.hour, idx.minute
+
+            active = _safe(row.get("orb_signal2_active", 0)) > 0
+            sdir   = float(np.sign(_safe(row.get("orb_signal2_dir", 0))))
+            in_window = (hour in (12, 13)) or (hour == 14 and minute <= 30)
+
+            if not fired and active and sdir != 0 and in_window:
+                target, fired, holding = sdir * RULE_TARGET, True, True
+                n_trades += 1
+            if hour >= 15:
+                target = 0.0
+
+            action = np.array([target, 0.0], dtype=np.float32)
+            next_obs, r, done, trunc, info = env.step(action)
+
+            obs_l.append(obs); act_l.append(action); rew_l.append(r)
+            next_l.append(next_obs); done_l.append(done); trunc_l.append(trunc)
+            obs = next_obs
+
+            # Env closed the position (SL hit) or blocked the entry — go flat
+            if holding and env._pos_n50 == 0.0:
+                holding, target = False, 0.0
+        total_pnl += info.get("daily_pnl", 0.0)
+
+    print(f"  Demonstrations: {len(obs_l):,} transitions, "
+          f"{n_trades} rule trades, cumulative P&L ₹{total_pnl:,.0f}")
+    return (np.array(obs_l,  dtype=np.float32),
+            np.array(act_l,  dtype=np.float32),
+            np.array(rew_l,  dtype=np.float32),
+            np.array(next_l, dtype=np.float32),
+            np.array(done_l, dtype=bool),
+            np.array(trunc_l, dtype=bool))
+
+
+def seed_replay_buffer(model: SAC, demos) -> None:
+    """Pre-fill the replay buffer with rule-policy transitions so the critic
+    trains on profitable behaviour from step one instead of pure noise."""
+    obs, acts, rews, next_obs, dones, truncs = demos
+    for i in range(len(obs)):
+        model.replay_buffer.add(
+            obs[i][None, :], next_obs[i][None, :], acts[i][None, :],
+            np.array([rews[i]]), np.array([dones[i]]),
+            [{"TimeLimit.truncated": bool(truncs[i] and not dones[i])}],
+        )
+    print(f"  Replay buffer seeded: {model.replay_buffer.size():,} transitions")
+
+
+def pretrain_actor_bc(model: SAC, obs: np.ndarray, actions: np.ndarray,
+                      epochs: int = 15, batch_size: int = 512) -> None:
+    """
+    Supervised pretraining: regress the actor's deterministic output onto the
+    rule policy's actions. The agent starts at the rules' performance and RL
+    only has to learn deviations that improve on them — instead of
+    rediscovering the rules from scratch through random exploration.
+    """
+    device = model.device
+    obs_t = torch.as_tensor(obs, device=device)
+    act_t = torch.as_tensor(actions, device=device)
+    n = len(obs_t)
+    # Separate optimizer at supervised-learning LR — the actor's own optimizer
+    # runs at 3e-5 (tuned for RL stability) which would badly underfit BC,
+    # and using it here would pollute its Adam momentum state before RL starts.
+    opt = torch.optim.Adam(model.actor.parameters(), lr=1e-3)
+
+    for ep in range(epochs):
+        perm, total = torch.randperm(n, device=device), 0.0
+        for s in range(0, n, batch_size):
+            idx  = perm[s:s + batch_size]
+            pred = model.actor(obs_t[idx], deterministic=True)
+            loss = torch.nn.functional.mse_loss(pred, act_t[idx])
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            total += loss.item() * len(idx)
+        print(f"  BC epoch {ep + 1:2d}/{epochs}  mse={total / n:.6f}")
+
+
+# ── stdout tee → logs/training_log.txt ───────────────────────────────────────
+
+class _Tee:
+    """Duplicates a stream to the training log file."""
+    def __init__(self, stream, fh):
+        self._stream, self._fh = stream, fh
+
+    def write(self, data):
+        self._stream.write(data)
+        self._fh.write(data)
+        self._fh.flush()
+
+    def flush(self):
+        self._stream.flush()
+        self._fh.flush()
+
+
 # ── Debug helper ─────────────────────────────────────────────────────────────
 
 def debug_env(env: NiftyTradingEnv, n_steps: int = 200):
@@ -750,6 +921,24 @@ def debug_env(env: NiftyTradingEnv, n_steps: int = 200):
 # ── Main training function ────────────────────────────────────────────────────
 
 def run_sac_training() -> None:
+    """Wrapper: mirrors all console output to logs/training_log.txt so runs
+    can be reviewed without scrolling the terminal."""
+    LOGS_DIR.mkdir(exist_ok=True)
+    log_fh = open(TRAINING_LOG, "a", encoding="utf-8")
+    old_out, old_err = sys.stdout, sys.stderr
+    sys.stdout = _Tee(old_out, log_fh)
+    sys.stderr = _Tee(old_err, log_fh)
+    print(f"\n{'=' * 70}\n"
+          f"TRAINING RUN {datetime.datetime.now():%Y-%m-%d %H:%M:%S}\n"
+          f"{'=' * 70}")
+    try:
+        _run_sac_training()
+    finally:
+        sys.stdout, sys.stderr = old_out, old_err
+        log_fh.close()
+
+
+def _run_sac_training() -> None:
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
     n50_path  = FEATURES_DIR / "NIFTY_50_features.parquet"
@@ -804,7 +993,28 @@ def run_sac_training() -> None:
         **SAC_KWARGS
     )
 
+    # Element-wise gradient clamp on actor+critic — cheap guard against the
+    # exploding-gradient spikes that precede critic divergence (SB3 SAC has
+    # no max_grad_norm parameter).
+    for p in model.policy.parameters():
+        p.register_hook(lambda g: torch.nan_to_num(g).clamp(-10.0, 10.0))
+
+    # ── Behaviour-cloning warm start ──────────────────────────────────
+    print("\nCollecting Signal-2 rule demonstrations over the training set...")
+    demo_env = NiftyTradingEnv(
+        n50_df, nbank_df, TRAIN_START, TRAIN_END,
+        capital=CAPITAL, randomise_start=False, single_instrument=True
+    )
+    demos = collect_rule_demonstrations(demo_env)
+
+    print("Seeding replay buffer with demonstrations...")
+    seed_replay_buffer(model, demos)
+
+    print("Pretraining actor via behaviour cloning...")
+    pretrain_actor_bc(model, demos[0], demos[1])
+
     callbacks = [
+        CriticMonitorCallback(check_freq=2_000),
         CheckpointCallback(
             save_freq=10_000,
             save_path=checkpoint_path,
@@ -859,8 +1069,11 @@ def run_sac_training() -> None:
 
     print(f"\nSAC training complete.")
     print(f"  Final model  → {final_path}.zip")
-    print(f"  Best model   → {MODELS_DIR}/best_model.zip")
+    print(f"  Best model   → {MODELS_DIR}/best_model.zip  (use THIS one — best validated checkpoint)")
     print(f"  Metadata     → {MODELS_DIR}/metadata.json")
+    print(f"  Full log     → {TRAINING_LOG}")
+    print(f"  Diagnostics  → tensorboard --logdir {MODELS_DIR / 'tb_logs'}  "
+          f"(watch diagnostics/mean_q for critic divergence)")
     print("\n*** Run test-set evaluation next (touch 2024 data only once). ***")
 
 

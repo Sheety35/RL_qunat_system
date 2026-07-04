@@ -487,4 +487,66 @@ SESSION 2026-05-28 (cont.) — Persist eval metrics to log file
   "[Eval @N]  Sharpe=X  Sortino=X  MaxDD=X%  WinRate=X%"
   run_sac_training() passes log_path=MODELS_DIR/"eval_metrics.log".
 
+--------------------------------------------------------------------------------
+SESSION 2026-06-18 — Remove LSTM regime classifier entirely
+--------------------------------------------------------------------------------
+
+[2026-06-18] regime_trainer.py :: DELETED — entire file removed. Contained the
+  RegimeLSTM model, LSTM training loop (run_regime_training), and parquet
+  enrichment (run_regime_enrichment). No longer needed in the pipeline.
+
+[2026-06-18] models/regime_classifier/ :: DELETED — removed best_model.pt and
+  scaler.pkl. Saved LSTM checkpoint no longer relevant after regime_trainer.py
+  was removed.
+
+[2026-06-18] train.py :: Removed Phase 1 and Phase 2 references. Deleted
+  run_phase1(), run_phase2() functions and their imports from regime_trainer.
+  Updated module docstring, check_prerequisites(), --phase help text, and main()
+  dispatch block. Default phase string changed from "0123" to "03".
+
+[2026-06-18] live_trader.py :: Removed all LSTM/regime code. Deleted RegimeInferencer
+  class; removed imports of torch, pickle, deque, RegimeLSTM, SEQ_LEN; removed
+  MODELS_DIR, REGIME_SEQ_LEN, _REGIME_NAME constants. Simplified check_signal2() to
+  pure ORB breakout (removed regime condition). Updated Position.open(), _enter(),
+  _exit(), and PaperLogger.COLUMNS to remove regime field throughout.
+
 ================================================================================
+--------------------------------------------------------------------------------
+SESSION 2026-07-04 — SAC stability fixes: entropy retune, BC warm start from
+Signal-2 rules, critic divergence guards, training log file
+--------------------------------------------------------------------------------
+
+[2026-07-04] sac_trainer.py :: Entropy coefficient retuned — ent_coef changed
+  from fixed 0.2 to "auto" with target_entropy=-1.0 (vs SB3 default -2 for the
+  2D action space). Fixed 0.2 dominated the small per-bar rewards as the critic
+  sharpened, pulling the policy back toward randomness (the "forgets everything"
+  collapse). The earlier auto-tune collapse to ~0.003 was premature convergence;
+  the target-entropy floor addresses that instead of freezing the coefficient.
+
+[2026-07-04] sac_trainer.py :: Critic divergence guards — tau lowered 0.005 →
+  0.002 so target networks move slower (dampens Q-overestimation compounding),
+  and element-wise gradient clamp (±10, NaN-scrubbed) registered on all
+  actor/critic parameters since SB3 SAC exposes no max_grad_norm.
+
+[2026-07-04] sac_trainer.py :: New CriticMonitorCallback — logs mean min-Q over
+  a 256-sample replay batch and the live entropy coefficient to TensorBoard
+  (diagnostics/mean_q, diagnostics/ent_coef) every 2k steps; prints a warning
+  when |mean Q| approaches the theoretical ceiling of 60 (reward clip 3 /
+  (1 - gamma 0.95)), which signals overestimation divergence before collapse.
+
+[2026-07-04] sac_trainer.py :: Behaviour-cloning warm start — new
+  collect_rule_demonstrations() rolls the Signal-2 rule policy (enter in
+  orb_signal2_dir at 0.6 size in the 12:00–14:30 window, one trade/day, env
+  handles SL/EOD) over all training days; pretrain_actor_bc() regresses the
+  actor onto those actions for 15 epochs with a dedicated Adam(lr=1e-3) so the
+  agent starts at the rules' performance instead of random exploration.
+
+[2026-07-04] sac_trainer.py :: Replay buffer demo seeding — seed_replay_buffer()
+  pre-fills the buffer with all rule-policy transitions so the critic trains on
+  profitable behaviour from the first gradient step; learning_starts lowered
+  20,000 → 5,000 since the diverse-transitions requirement is now met by demos.
+
+[2026-07-04] sac_trainer.py :: Training log file — run_sac_training() now tees
+  all stdout/stderr (including SB3 tables, eval results, BC progress) to
+  logs/training_log.txt with a timestamped run header, so runs can be reviewed
+  without scrolling the terminal.

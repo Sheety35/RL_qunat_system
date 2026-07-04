@@ -1,128 +1,234 @@
 # NSE Intraday Trading System
 
-Intraday algorithmic trading system for NSE indices (NIFTY 50 and NIFTY BANK) using a 3-layer ML architecture with hard guardrails and an ORB signal engine.
-
-Full details: [TRAINING_PLAN.md](TRAINING_PLAN.md)
+Intraday algorithmic trading system for NSE indices (NIFTY 50 and NIFTY BANK) using a two-phase ML pipeline — feature engineering followed by a SAC reinforcement learning agent — with hard guardrails and an ORB signal engine.
 
 ---
 
 ## Architecture
 
 ```
-NIFTY 50 + NIFTY BANK + 15 sector index CSVs (5-min OHLCV)
+NIFTY 50 + NIFTY BANK + 9 sector index CSVs (5-min OHLCV)
                         |
-          +-------------+-------------+
-          |                           |
-  Layer 1: LSTM Classifier     ORB Engine (rules)
-  (supervised, softmax)        Signal 1 (11AM) → standalone rule
-  Bull / Bear / Flat           Signal 2 (afternoon) → SAC feature
-          |                           |
-  Layer 2: Trend Detector            |
-  Rule-based: UP/DOWN/FLAT           |
-          |                           |
-          +-------------+-------------+
+              Phase 0: Feature Engineering
+              ATR, RSI, MACD, Bollinger, ADX, EMA,
+              TWAP, sector breadth, ORB signals
                         |
-                Layer 3: SAC
-                Continuous sizing: -1.0 to +1.0
-                (short 100% <-> long 100%)
-                        |
-              Hard Guardrail Layer
-              Pure Python rules — overrides model output
-                        |
-                Upstox Execution API
+              +----------+-----------+
+              |                      |
+        ORB Engine               Phase 3: SAC
+        Signal 1 (~17/yr)        Continuous sizing: -1.0 to +1.0
+        standalone rule          Two action heads:
+        (no SAC involved)          action[0] = NIFTY 50 size
+                                   action[1] = NIFTY BANK size
+        Signal 2 (~200/yr)       Shared capital pool
+        passed as features
+        to SAC
+              |                      |
+              +----------+-----------+
+                         |
+               Hard Guardrail Layer
+               Pure Python rules — overrides all model output
+                         |
+               Upstox Execution API
 ```
 
 ---
 
-## Model summary
+## Pipeline
 
-| Layer | Type | What it does |
-|---|---|---|
-| Layer 1 | LSTM Classifier (supervised) | Classifies current market regime (Bull/Bear/Flat) from last 50 candles; softmax head; also outputs confidence probability used by HG11 |
-| Layer 2 | Rule-based | Detects trend direction and strength (ADX, EMA, SMA) |
-| ORB Engine | Rule-based | Signal 1 (~17/yr) executes as a standalone rule, NOT routed through SAC. Signal 2 (~200/yr) passes `orb_signal2_active` and `orb_signal2_direction` to SAC as features |
-| Layer 3 | SAC — single multi-output agent | Two action heads: `action[0]` = NIFTY 50 size, `action[1]` = NIFTY BANK size (each −1.0 to +1.0). Shared capital pool — if total exposure > 80%, both outputs scaled proportionally |
-| Guardrails | Pure Python | Hard rules that override any model output (see below) |
+| Phase | Script | What it does | Status |
+|---|---|---|---|
+| 0 | `feature_engineering.py` | Reads 17 raw CSVs, computes all indicators, adds ORB signals, saves two enriched parquets to `features/` | Built |
+| 3 | `sac_trainer.py` | Trains single multi-output SAC agent (NIFTY 50 + NIFTY BANK) from the parquets | Built |
+
+Run everything:
+```
+./venv/Scripts/python.exe train.py
+```
+
+Run a single phase:
+```
+./venv/Scripts/python.exe train.py --phase 0   # feature engineering only
+./venv/Scripts/python.exe train.py --phase 3   # SAC training only
+./venv/Scripts/python.exe train.py --phase 3 --timesteps 200000
+```
 
 ---
 
-## Hard guardrails (model cannot override these)
+## SAC Agent
+
+**Environment:** `NiftyTradingEnv` (gymnasium.Env)
+
+One episode = one trading day. `reset()` picks the next sequential day; `step(action)` advances one 5-min bar and returns the ATR-normalised P&L reward.
+
+**Observation space (52 features per bar):**
+
+| Group | Features | Count |
+|---|---|---|
+| NIFTY 50 per-bar | `close_return`, `ema_spread_pct`, `price_vs_sma20`, `rsi14`, `macd_pct`, `atr14_pct`, `bb_width`, `bb_position`, `price_vs_vwap`, `volume_ratio` | 10 |
+| NIFTY BANK per-bar | same 10 columns from NBANK parquet | 10 |
+| Shared market context | `sector_breadth_norm`, `bank_vs_n50_spread`, `orb_range_pct`, `daily_trend`, `is_high_vol_day`, `atr_percentile_20d`, `monthly_trend`, `dist_from_52w_high`, `orb_signal2_active`, `orb_signal2_dir`, `slot_0`–`slot_5`, `day_of_week`, `minutes_to_close` | 18 |
+| Portfolio state | Current N50 position, NBANK position, unrealised P&L, daily P&L, trades today, vol ratio, and 2 spare | 8 |
+| Regime placeholder | Zeroed — regime classifier removed | 4 |
+
+**Action space:** `Box([-1,-1], [1,1])` — target allocation fraction per instrument. Magnitudes below dead-band `0.30` are treated as flat.
+
+**Reward:** `pnl_pts / (daily_atr × 0.5)` clipped to `[-3, +3]`. Regime-direction nudge `±0.2` applied when the agent trades against the daily trend.
+
+**Training split (walk-forward, never mixed):**
+- Train: `2019-01-01 → 2023-06-30` (includes first-half 2023 calm market alongside 2019–2022 high-vol)
+- Validate: `2023-07-01 → 2023-12-31`
+- Test: `2024-01-01 → 2024-12-31` — touch once only at the very end
+
+**Key hyperparameters:**
+
+| Param | Value | Reason |
+|---|---|---|
+| `gamma` | 0.95 | Short episodes (~70 bars/day); 0.99 made early and late bars nearly equal weight |
+| `ent_coef` | 0.2 (fixed) | Auto-tuning collapsed to 0.003 by 40k steps every run |
+| `learning_rate` | 3e-5 | Smaller LR needed after critic loss oscillation at 3e-4 |
+| `learning_starts` | 20,000 | Buffer needs diverse transitions before gradient updates |
+| `net_arch` | [128, 128] | Simpler network adequate for single-instrument mode |
+| `TOTAL_TIMESTEPS` | 500,000 | 1M caused overfitting to 2019–2022 high-vol regime |
+
+---
+
+## ORB Engine
+
+Computes Opening Range Breakout signals from the first 8 bars of each day (9:15–9:54).
+
+**Signal 1 (~17 trades/year):** 11:05 AM high-conviction breakout. Fires as a standalone rule — SAC is not involved. Two tiers:
+- Tier 1: ORB move ≥ 0.70%, ADX ≥ 55, TWAP/ATR ≥ 2.0 → 2% risk
+- Tier 2: ORB move ≥ 0.45%, ADX ≥ 45, TWAP/ATR ≥ 1.5 → 1.5% risk
+
+**Signal 2 (~200 trades/year):** Afternoon ORB retest in the 12:00–14:25 window. The flag columns `orb_signal2_active` and `orb_signal2_dir` are passed to the SAC as input features. The agent decides whether and how large to size the trade.
+
+---
+
+## Feature Engineering (Phase 0)
+
+Reads 17 raw CSVs from `data/`, computes the following for each bar, and saves to `features/NIFTY_50_features.parquet` and `features/NIFTY_BANK_features.parquet`.
+
+| Feature | Description |
+|---|---|
+| `close_return` | 1-bar log return |
+| `ema_spread_pct` | (EMA9 − EMA21) / close |
+| `price_vs_sma20` | Distance from 20-day SMA |
+| `rsi14` | RSI (0–100) |
+| `macd_pct` | MACD / close |
+| `atr14_pct` | ATR(14) / close |
+| `bb_width` | Bollinger Band width / close |
+| `bb_position` | (close − lower) / (upper − lower) |
+| `price_vs_vwap` | (close − TWAP) / TWAP — uses TWAP since NIFTY is an index with no volume |
+| `volume_ratio` | Bar range / rolling 20-bar mean range |
+| `adx14`, `di_plus`, `di_minus` | ADX trend strength |
+| `daily_trend` | Rule-based: +1 UP / −1 DOWN / 0 FLAT (EMA + ADX) |
+| `monthly_trend` | 20-day EMA direction |
+| `dist_from_52w_high` | % below rolling 52-week high |
+| `atr_percentile_20d` | ATR rank vs 20-day window |
+| `is_high_vol_day` | 1 if ATR > mean + 0.5×std (20d) |
+| `sector_breadth_norm` | Fraction of 9 sector indices above their own 20-day SMA |
+| `bank_vs_n50_spread` | NIFTY BANK return − NIFTY 50 return |
+| ORB columns | `orb_high`, `orb_low`, `orb_range_pct`, `orb_valid`, `orb_signal2_active`, `orb_signal2_dir`, `sig1_tier` |
+| Time features | `slot_0`–`slot_5` (one-hot 5-min time slot), `day_of_week`, `minutes_to_close` |
+
+---
+
+## Hard Guardrails
+
+All rules live in `guardrails.py`. They override every model output — the SAC cannot bypass them.
 
 | # | Rule | Trigger | Action |
 |---|---|---|---|
-| HG1 | Time fence | Before 09:55 or after 15:00 | Block all new entries |
-| HG2 | Daily loss halt | Drawdown > 3% in a day | Exit all, halt trading for the day |
+| HG1 | Time fence | Before 09:55 or at/after 15:00 | Block all new entries |
+| HG2 | Daily loss halt | Drawdown > 3% of capital in a day | Exit all positions, halt for the day |
 | HG3 | Max trade risk | SL distance > 2% of capital | Reduce lot size |
-| HG4 | Position cap | Any single instrument > 30% of capital | Block buy |
+| HG4 | Position cap | Single instrument > 30% of capital | Block new buy |
 | HG5 | Total exposure cap | Sum of positions > 80% of capital | Scale both SAC outputs proportionally |
 | HG6 | ORB range filter | ORB range > 2% or < 0.1% | Skip ORB signals for the day |
 | HG7 | Conflict filter | Signal 1 fired opposite to Signal 2 direction | Skip Signal 2 |
 | HG8 | 15:00 hard exit | Clock hits 15:00 | Market-sell everything, no exceptions |
-| HG9 | Stop loss required | Any new entry | Reject order if no SL attached |
-| HG10 | Extreme volatility scaling | ATR > 3× rolling 20d mean ATR | Halve all new position sizes; disable Signal 2 for the day |
-| HG11 | Regime uncertainty gate | `max(regime_softmax_probs) < 0.5` | Cap SAC action magnitude at ±0.3 |
+| HG9 | Stop loss required | Any new entry | Reject if no SL attached |
+| HG10 | Extreme volatility | ATR > mean + 0.5×std (20d) | Halve all new position sizes |
+| HG11 | Regime uncertainty gate | `regime_max_prob < 0.5` | Cap SAC action to ±0.3 — currently a no-op (regime removed) |
+
+---
+
+## Live Trader
+
+`live_trader.py` implements real-time Signal 2 paper/live trading for NIFTY 50 via the Upstox API.
+
+**How it works:**
+1. Every 5 minutes, polls `GET /v2/historical-candle/intraday/NSE_INDEX|Nifty 50/5minute`
+2. Computes incremental ATR(14) and TWAP on each new bar
+3. Locks the ORB range from 9:15–9:54 bars
+4. In the 12:00–14:30 window: fires a trade if close breaks above ORB high (long) or below ORB low (short), confirmed by TWAP
+5. One trade per day (`signal_fired` flag prevents re-entry)
+6. All entries checked through `guardrails.check_entry()` (HG1, HG2 enforced)
+7. SL = entry ± 2×ATR, TP = entry ± 4×ATR, forced EOD exit at 15:00
+8. `PAPER_MODE = True` logs to `logs/paper_trades_YYYY-MM-DD.csv`; `False` sends orders via Upstox
+
+**Token setup (each morning):**
+```
+./venv/Scripts/python.exe get_token.py
+# Opens browser → paste redirect URL → token saved to .env automatically
+./venv/Scripts/python.exe live_trader.py
+```
 
 ---
 
 ## Data
 
-All training uses only the 17 CSVs already in `data/`. No additional data will be pulled.
+All training uses only the 17 CSVs in `data/`. No additional data will be pulled.
 
 | File | Rows | Range | Role |
 |---|---|---|---|
-| NIFTY 50_5minute.csv | 204,167 | 2015–2026 | Primary trading instrument + regime training |
-| NIFTY BANK_5minute.csv | 204,157 | 2015–2026 | Secondary trading instrument |
-| NIFTY AUTO, ENERGY, FIN SERVICE, FMCG, INFRA, IT, COMMODITIES, CONSUMPTION (+ BANK already above) | 147k–204k each | 2015–2026 | **Sector breadth** (9 long-history indices only — all start 2015) |
-| NIFTY ALPHA 50, CPSE, GS COMPSITE, CONSR DURBL, HEALTHCARE, IND DIGITAL, INDIA MFG | 63k–121k | varies | NOT used for breadth (shorter history causes NaNs before 2022) |
-
-Training split (walk-forward, never mixed):
-- **Train:** 2019–2022 (bull run, COVID crash, 2022 rate-shock bear)
-- **Validate:** 2023 (out-of-sample)
-- **Test:** 2024 (touch once at the very end only)
+| `NIFTY 50_5minute.csv` | 204,167 | 2015–2026 | Primary trading instrument |
+| `NIFTY BANK_5minute.csv` | 204,157 | 2015–2026 | Secondary trading instrument |
+| NIFTY AUTO, ENERGY, FIN SERVICE, FMCG, INFRA, IT, COMMODITIES, CONSUMPTION, BANK | 147k–204k each | 2015–2026 | **Sector breadth** (9 long-history indices used) |
+| NIFTY ALPHA 50, CPSE, GS COMPSITE, CONSR DURBL, HEALTHCARE, IND DIGITAL, INDIA MFG | 63k–121k | varies | Not used — shorter history causes NaN gaps before 2022 |
 
 ---
 
-## Capital and risk rules
+## Capital and Risk
 
-- Starting capital: ₹50,000 (paper money)
+- Starting capital: ₹50,000 (paper)
 - Max position per instrument: 30% of capital
 - Max risk per trade: 2% of capital
 - Max daily loss: 3% of capital → halt for the day
 - No overnight positions — all squared off by 15:00
 
-**Transaction costs and slippage (applied on every order, training and backtest):**
-- Brokerage: ₹20 flat per order (Upstox)
-- STT: 0.01% of turnover, sell side only
-- Exchange charges: 0.005% of turnover
-- Slippage: 1 pt average for NIFTY 50, 2 pts for NIFTY BANK
-- Formula: `cost = 20 + (value × 0.0001 if SELL) + (value × 0.00005) + (slip_pts × lot_size × lots)`
-- Lot sizes: NIFTY 50 = 75, NIFTY BANK = 35
+**Transaction costs (applied on every order, training and backtest):**
+
+| Cost | Rate |
+|---|---|
+| Brokerage | ₹20 flat per order |
+| STT | 0.01% of turnover, sell side only |
+| Exchange charges | 0.005% of turnover |
+| Slippage | 1 pt (NIFTY 50) / 2 pts (NIFTY BANK) |
+| Lot sizes | NIFTY 50 = 75, NIFTY BANK = 35 |
 
 ---
 
 ## Files
 
-| File | Purpose |
-|---|---|
-| `data_puller.py` | Upstox OAuth + historical data fetch (data collection complete, not needed again) |
-| `orb_engine.py` | ORB signal computation — to be built |
-| `guardrails.py` | Hard guardrail rules — to be built |
-| `feature_engineering.py` | Compute all indicators + sector breadth, save `features/` — to be built |
-| `regime_trainer.py` | Train supervised LSTM Classifier on NIFTY 50 — to be built |
-| `sac_trainer.py` | Train single multi-output SAC (NIFTY 50 + NIFTY BANK) — to be built |
-| `backtest.py` | Walk-forward evaluation, Sharpe + Sortino output — to be built |
-| `live_trader.py` | Paper → live trading via Upstox API — to be built |
-| `TRAINING_PLAN.md` | Full architecture, guardrails, all model questions, training pipeline |
-| `STOCK_TRADING_GUIDE.md` | Feasibility assessment and 6-month roadmap |
+| File | Purpose | Status |
+|---|---|---|
+| `train.py` | Master pipeline runner — chains Phase 0 → Phase 3 | Built |
+| `feature_engineering.py` | Phase 0: compute all indicators + ORB signals, save parquets | Built |
+| `sac_trainer.py` | Phase 3: train multi-output SAC agent | Built |
+| `guardrails.py` | Hard guardrail rules HG1–HG11, transaction cost formula | Built |
+| `orb_engine.py` | ORB signal computation (Signal 1 and Signal 2 columns) | Built |
+| `live_trader.py` | Real-time Signal 2 paper/live trading via Upstox | Built |
+| `get_token.py` | Daily Upstox OAuth token refresh | Built |
+| `data_puller.py` | Historical data fetch via Upstox (data collection complete, not needed again) | Built |
+| `backtest.py` | Walk-forward evaluation on 2024 test set | **Not built** |
+| `TRAINING_PLAN.md` | Full architecture notes and training decisions log | Reference |
 
 ---
 
-## Next steps
+## Next Steps
 
-1. `orb_engine.py`
-2. `guardrails.py`
-3. `feature_engineering.py`
-4. `regime_trainer.py`
-5. `sac_trainer.py`
-6. `backtest.py`
-7. Paper trade 1 month minimum before live capital
+1. Validate current SAC model: Sharpe > 1.5 and MaxDD < 15% on the 2023-H2 validation set
+2. Build `backtest.py` — walk-forward evaluation on 2024 test data (touch once only)
+3. Paper trade ≥ 1 month before committing live capital
